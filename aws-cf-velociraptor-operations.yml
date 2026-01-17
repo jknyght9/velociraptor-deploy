@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Metadata:
+  License: Apache-2.0
+Description: Velociraptor server for operations
+Parameters:
+  AMIUbuntu2204:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+  AWSRoute53HostedZoneID:
+    Description: AWS Route53 hosted zone ID
+    Type: String
+  AWSSubnetPublicID:
+    Description: AWS public subnet ID
+    Type: String
+  AWSVPCID:
+    Description: AWS VPC ID
+    Type: String
+  Domain:
+    Description: Domain name for the URL
+    Type: String
+    Default: mydomain
+  Hostname:
+    Description: Velociraptor hostname
+    Type: String
+    Default: veloc
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair
+  OAuthClientID:
+    Description: Azure OAuth Client ID
+    Type: String
+  OAuthClientSecret:
+    Description: Azure OAuth Client Secret
+    Type: String
+  TenantID:
+    Description: Azure Tenant ID
+    Type: String
+Mappings:
+  Hosts:
+    Velociraptor:
+      Type: t3a.xlarge
+Resources:
+  SecretsManagerVelociraptorAdminPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "VelociraptorAdminPassword-${Hostname}"
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+        IncludeSpace: false
+        RequireEachIncludedType: true
+  EC2IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-EC2Role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SecretsManagerVelociraptorAdminPassword
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2IAMRole
+  SecurityGroupVelociraptorPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "jdclabs-ops-veloc-${Hostname}-public"
+      GroupDescription: Allows communication to Velociraptor from the Internet
+      VpcId: !Ref "AWSVPCID"
+      Tags:
+        - Key: Name
+          Value: !Sub "jdclabs-ops-veloc-${Hostname}-public"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 72.177.253.186/32
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+  InstanceVelociraptor:
+    Type: AWS::EC2::Instance
+    DependsOn: SecurityGroupVelociraptorPublic
+    Properties:
+      InstanceType: !FindInMap ["Hosts", "Velociraptor", "Type"]
+      KeyName: !Ref "KeyName"
+      ImageId: !Ref AMIUbuntu2204
+      SecurityGroupIds:
+        - !Ref "SecurityGroupVelociraptorPublic"
+      SubnetId: !Ref "AWSSubnetPublicID"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "jdclabs-ops-veloc-${Hostname}"
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 150
+            VolumeType: gp2
+            DeleteOnTermination: true
+            Encrypted: false
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          DOMAIN="${Domain}"
+          HOSTNAME="${Hostname}"
+          OAUTH_CLIENT_ID="${OAuthClientID}"
+          OAUTH_CLIENT_SECRET="${OAuthClientSecret}"
+          PATH_CERTCACHE="/velociraptor/cert_cache"
+          PATH_CLIENTS="/velociraptor/clients"
+          PATH_DATASTORE="/velociraptor"
+          PATH_FILESTORE="/velociraptor"
+          PATH_LOG="/velociraptor/logs"
+          PATH_PUBLIC="public"
+          PORT_FRONTEND=443
+          PORT_GUI=8000
+          TENANT_ID="${TenantID}"
+          VELOX_USER="vradmin"
+
+          VELOX_PASS="$(aws secretsmanager get-secret-value \
+            --secret-id "VelociraptorAdminPassword-${Hostname}" \
+            --region us-east-1 \
+            --query SecretString \
+            --output text 2>/dev/null || true)"
+          if [[ -z "$VELOX_PASS" || "$VELOX_PASS" == "None" ]]; then
+            echo "WARNING: Could not retrieve VelociraptorAdminPassword-${Hostname} from Secrets Manager."
+            echo "Falling back to default password."
+            VELOX_PASS="VelociraptorDefaultPassword123!"
+          fi
+
+          apt-get update
+          apt-get install -y awscli curl wget jq rsync nginx
+          hostnamectl set-hostname $HOSTNAME
+          mkdir -p /opt/velociraptor
+          for i in bsd linux mac windows; do mkdir -p /opt/velociraptor/$i; done
+          BSD_BIN_AMD=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("freebsd-amd64") )))')
+          LINUX_BIN_AMD=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("linux-amd64") )))')
+          LINUX_BIN_AMD_MUSL=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("linux-amd64-musl") )))')
+          LINUX_BIN_ARM=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("linux-arm64") )))')
+          MAC_BIN_AMD=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("darwin-amd64") )))')
+          MAC_BIN_ARM=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("darwin-arm64") )))')
+          WINDOWS_EXE=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("windows-amd64.exe") )))') 
+          WINDOWS_MSI=$(curl -s https://api.github.com/repos/velocidex/velociraptor/releases/latest | jq -r 'limit(1 ; ( .assets[].browser_download_url | select ( contains("windows-amd64.msi") )))')
+          wget -O /opt/velociraptor/bsd/velociraptor_client_amd64 "$BSD_BIN_AMD"
+          wget -O /opt/velociraptor/linux/velociraptor_client_amd64 "$LINUX_BIN_AMD"
+          wget -O /opt/velociraptor/linux/velociraptor_client_amd64_musl "$LINUX_BIN_AMD_MUSL"
+          wget -O /opt/velociraptor/linux/velociraptor_client_arm64 "$LINUX_BIN_ARM"
+          wget -O /opt/velociraptor/mac/velociraptor_client_amd64 "$MAC_BIN_AMD"
+          wget -O /opt/velociraptor/mac/velociraptor_client_arm64 "$MAC_BIN_ARM"
+          wget -O /opt/velociraptor/windows/velociraptor_client.exe "$WINDOWS_EXE"
+          wget -O /opt/velociraptor/windows/velociraptor_client.msi "$WINDOWS_MSI" 
+          mkdir -p velociraptor
+          cd velociraptor
+          cp /opt/velociraptor/linux/velociraptor_client_amd64 .
+          mv velociraptor_client_amd64 velociraptor
+          chmod +x velociraptor
+          mkdir -p $PATH_CLIENTS/bsd && rsync -a /opt/velociraptor/bsd/velociraptor_client* $PATH_CLIENTS/bsd/velociraptor_client
+          mkdir -p $PATH_CLIENTS/linux && rsync -a /opt/velociraptor/linux/velociraptor_client* $PATH_CLIENTS/linux/velociraptor_client
+          mkdir -p $PATH_CLIENTS/mac && rsync -a /opt/velociraptor/mac/velociraptor_client* $PATH_CLIENTS/mac/velociraptor_client
+          mkdir -p $PATH_CLIENTS/windows && rsync -a /opt/velociraptor/windows/velociraptor_client* $PATH_CLIENTS/windows/
+          mkdir -p $PATH_CERTCACHE
+          base_config='{
+            "autocert_cert_cache": "'"$PATH_CERTCACHE"'",
+            "Frontend": {
+              "public_path": "'"$PATH_PUBLIC"'",
+              "hostname": "'"$HOSTNAME.$DOMAIN"'",
+              "bind_port": '"$PORT_FRONTEND"'
+            },
+            "Logging": {
+              "output_directory": "'"$PATH_LOG"'",
+              "separate_logs_per_component": true
+            },
+            "Client": {
+              "server_urls": ["https://'"$HOSTNAME.$DOMAIN"'/" ]
+            },
+            "Datastore": {
+              "location": "'"$PATH_DATASTORE"'",
+              "filestore_directory": "'"$PATH_FILESTORE"'"
+            },
+            "GUI": {
+              "bind_address": "0.0.0.0",
+              "bind_port": '"$PORT_GUI"',
+              "public_url": "https://'"$HOSTNAME.$DOMAIN"'/app/index.html"
+            }
+          }'
+          if [ -n "$TENANT_ID" ]; then
+            authenticator_config='{
+              "authenticator": {
+                "type": "azure",
+                "oauth_client_id": "'"$OAUTH_CLIENT_ID"'",
+                "oauth_client_secret": "'"$OAUTH_CLIENT_SECRET"'",
+                "tenant": "'"$TENANT_ID"'",
+                "auth_redirect_template": "https://'"$HOSTNAME.$DOMAIN"'/auth/azure/callback",
+                "default_roles_for_unknown_user": ["investigator"]
+              }
+            }'
+            config=$(jq -n --argjson base "$base_config" --argjson auth "$authenticator_config" '$base.GUI += $auth | $base')
+          else
+            # Use the base config only
+            config=$(jq -n --argjson base "$base_config" '$base')
+          fi
+          ./velociraptor config generate --merge "$base_config" > server.config.yaml
+          ./velociraptor --config server.config.yaml config client > client.config.yaml
+          ./velociraptor --config server.config.yaml debian server --binary /velociraptor/velociraptor
+          ./velociraptor --config server.config.yaml user add $VELOX_USER $VELOX_PASS --role administrator
+          ./velociraptor --config server.config.yaml artifacts collect Server.Import.ArtifactExchange > /dev/null
+          dpkg -i velociraptor*.deb
+          chown -R velociraptor:velociraptor acl/ artifact_definitions/ clients/ users/
+          ./velociraptor config repack --exe /opt/velociraptor/bsd/velociraptor_client_amd64 client.config.yaml /opt/velociraptor/bsd/velociraptor_agent_amd64
+          ./velociraptor config repack --exe /opt/velociraptor/linux/velociraptor_client_amd64 client.config.yaml /opt/velociraptor/linux/velociraptor_agent_amd64
+          ./velociraptor config repack --exe /opt/velociraptor/linux/velociraptor_client_amd64_musl client.config.yaml /opt/velociraptor/linux/velociraptor_agent_amd64_musl
+          ./velociraptor config repack --exe /opt/velociraptor/linux/velociraptor_client_arm64 client.config.yaml /opt/velociraptor/linux/velociraptor_agent_arm64
+          ./velociraptor config repack --exe /opt/velociraptor/mac/velociraptor_client_amd64 client.config.yaml /opt/velociraptor/mac/velociraptor_agent_amd64
+          ./velociraptor config repack --exe /opt/velociraptor/mac/velociraptor_client_arm64 client.config.yaml /opt/velociraptor/mac/velociraptor_agent_arm64
+          ./velociraptor config repack --exe /opt/velociraptor/windows/velociraptor_client.exe client.config.yaml /opt/velociraptor/windows/velociraptor_agent.exe
+          ./velociraptor config repack --msi /opt/velociraptor/windows/velociraptor_client.msi client.config.yaml /opt/velociraptor/windows/velociraptor_agent.msi
+          cat << EOF > /etc/nginx/sites-available/$DOMAIN
+          server {
+            listen 8080 default_server;
+            server_name $HOSTNAME.$DOMAIN;
+            root /opt/velociraptor;
+            location / {
+              autoindex on;
+            }
+          }
+          EOF
+          rm /etc/nginx/sites-enabled/default
+          ln -s /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/$DOMAIN
+          systemctl reload nginx
+          chown velociraptor:velociraptor /velociraptor/config/inventory.json.db
+          chgrp www-data /opt/velociraptor
+          find /opt/velociraptor -name "*client*" -exec rm {} \;
+          find /opt/velociraptor -name "*agent*" -exec chmod 644 {} \;
+          chown -R velociraptor:velociraptor artifact_definitions/ acl/ config/ server_artifacts/ users/
+  Route53Velociraptor:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref "AWSRoute53HostedZoneID"
+      Name: !Join ["", [!Ref "Hostname", ".", !Ref "Domain", "."]]
+      ResourceRecords:
+        - !GetAtt InstanceVelociraptor.PublicIp
+      Type: A
+      TTL: 900
+Outputs:
+  InstanceVelociraptor:
+    Description: InstanceId of velociraptor
+    Value: !Ref InstanceVelociraptor
